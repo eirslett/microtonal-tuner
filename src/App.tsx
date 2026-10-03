@@ -1,14 +1,21 @@
 import { useEffect, useState } from 'react'
 import {
   A4_CHOICES,
-  HALF_STEP_CENTS,
+  EDO_CHOICES,
+  a4PitchClass,
   chromaticLabel,
   formatCents,
+  formatStepCents,
+  halfStepCents,
   intonationWord,
+  isEdo,
   pitchLabel,
   readStoredA4,
+  readStoredEdo,
   spellPitchClass,
   storeA4,
+  storeEdo,
+  type Edo,
   type PitchReading,
 } from './edo'
 import { useTuner } from './useTuner'
@@ -17,12 +24,26 @@ import './App.css'
 const OCTAVE_MIN = 3
 const OCTAVE_MAX = 6
 
-function place(pitchClass: number, radius: number): { left: string; top: string } {
-  const angle = ((pitchClass - 27) / 36) * Math.PI * 2 - Math.PI / 2
+function place(pitchClass: number, radius: number, edo: Edo): { left: string; top: string } {
+  const angle = ((pitchClass - a4PitchClass(edo)) / edo) * Math.PI * 2 - Math.PI / 2
   return {
     left: `${50 + Math.cos(angle) * radius}%`,
     top: `${50 + Math.sin(angle) * radius}%`,
   }
+}
+
+function idlePitchText(edo: Edo): string {
+  if (edo === 12) return 'The nearest semitone appears here.'
+  if (edo === 24) return 'The nearest quarter-tone appears here.'
+  return 'The nearest third-tone appears here.'
+}
+
+function compassHint(edo: Edo): string {
+  if (edo === 12) return 'Twelve equal semitones. A sits at the top.'
+  if (edo === 24) {
+    return '↑ raises by one quarter-tone. Brighter marks are the chromatic notes. A sits at the top.'
+  }
+  return '↑ raises by one step, ↓ lowers by one step. Brighter marks are the usual chromatic notes. A sits at the top.'
 }
 
 function markColor(cents: number): string {
@@ -34,19 +55,25 @@ function markColor(cents: number): string {
 
 export default function App() {
   const [a4Hz, setA4Hz] = useState(readStoredA4)
-  const tuner = useTuner(a4Hz)
+  const [edo, setEdo] = useState(readStoredEdo)
+  const tuner = useTuner(a4Hz, edo)
   const { frame, listening, error, toneOn, pin, cOctave, setToneHz } = tuner
   const reading = frame.reading
+  const halfStep = halfStepCents(edo)
 
   const tonePitch = pin
-    ? spellPitchClass(pin.pc, pin.cOctave, a4Hz)
+    ? spellPitchClass(pin.pc, pin.cOctave, a4Hz, edo)
     : reading
-      ? spellPitchClass(reading.pitchClass, reading.cOctave, a4Hz)
-      : spellPitchClass(27, 4, a4Hz)
+      ? spellPitchClass(reading.pitchClass, reading.cOctave, a4Hz, edo)
+      : spellPitchClass(a4PitchClass(edo), 4, a4Hz, edo)
 
   useEffect(() => {
     setToneHz(tonePitch.hz)
   }, [tonePitch.hz, setToneHz])
+
+  useEffect(() => {
+    document.title = `Oboe tuner · ${edo}-EDO`
+  }, [edo])
 
   const announcement = error
     ? error
@@ -69,29 +96,48 @@ export default function App() {
       <header className="top">
         <div>
           <p className="eyebrow">Oboe</p>
-          <h1>36-EDO tuner</h1>
+          <h1>{edo}-EDO tuner</h1>
         </div>
-        <label className="reference">
-          <span className="reference-row">
-            A<sub>4</sub>
+        <div className="tuning">
+          <div className="reference-row">
             <select
-              value={a4Hz}
-              aria-label="Concert A in hertz"
+              value={edo}
+              aria-label="Equal divisions of the octave"
               onChange={(event) => {
-                const hz = Number(event.target.value)
-                setA4Hz(hz)
-                storeA4(hz)
+                const next = Number(event.target.value)
+                if (!isEdo(next)) return
+                tuner.adoptEdo(next)
+                setEdo(next)
+                storeEdo(next)
               }}
             >
-              {A4_CHOICES.map((hz) => (
-                <option key={hz} value={hz}>
-                  {hz} Hz
+              {EDO_CHOICES.map((choice) => (
+                <option key={choice} value={choice}>
+                  {choice}-EDO
                 </option>
               ))}
             </select>
-          </span>
-          <span className="reference-note">one step = 33.3¢</span>
-        </label>
+            <label className="a4-field">
+              A<sub>4</sub>
+              <select
+                value={a4Hz}
+                aria-label="Concert A in hertz"
+                onChange={(event) => {
+                  const hz = Number(event.target.value)
+                  setA4Hz(hz)
+                  storeA4(hz)
+                }}
+              >
+                {A4_CHOICES.map((hz) => (
+                  <option key={hz} value={hz}>
+                    {hz} Hz
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <span className="reference-note">one step = {formatStepCents(edo)}¢</span>
+        </div>
       </header>
 
       <p className="sr-only" aria-live="polite">
@@ -103,7 +149,7 @@ export default function App() {
           className={reading && Math.abs(reading.cents) < 5 ? 'panel in-tune' : 'panel'}
           aria-label="Pitch"
         >
-          <Readout reading={reading} dim={!reading} />
+          <Readout reading={reading} dim={!reading} edo={edo} halfStep={halfStep} />
           <p className="status" style={reading ? { color: markColor(reading.cents) } : undefined}>
             {status}
           </p>
@@ -115,7 +161,7 @@ export default function App() {
                 <span className="freq-target">in tune {reading.hz.toFixed(1)} Hz</span>
               </>
             ) : (
-              'The nearest third-tone appears here.'
+              idlePitchText(edo)
             )}
           </p>
 
@@ -177,12 +223,12 @@ export default function App() {
           <div className="compass">
             <div className="compass-ring" />
             <div className="compass-center">
-              <span>36</span>
+              <span>{edo}</span>
               <small>equal</small>
             </div>
-            {Array.from({ length: 36 }, (_, pc) => {
-              const spelled = spellPitchClass(pc, cOctave, a4Hz)
-              const label = chromaticLabel(pc)
+            {Array.from({ length: edo }, (_, pc) => {
+              const spelled = spellPitchClass(pc, cOctave, a4Hz, edo)
+              const label = chromaticLabel(pc, edo)
               const held = pin?.pc === pc && pin.cOctave === cOctave
               const heard = reading?.pitchClass === pc
               return (
@@ -194,26 +240,24 @@ export default function App() {
                       ? `tick chromatic${heard ? ' is-heard' : ''}${held ? ' is-held' : ''}`
                       : `tick${heard ? ' is-heard' : ''}${held ? ' is-held' : ''}`
                   }
-                  style={place(pc, 34)}
+                  style={place(pc, 34, edo)}
                   aria-label={pitchLabel(spelled)}
                   aria-pressed={held}
                   onClick={() => tuner.selectPitch(pc)}
                 />
               )
             })}
-            {Array.from({ length: 36 }, (_, pc) => {
-              const label = chromaticLabel(pc)
+            {Array.from({ length: edo }, (_, pc) => {
+              const label = chromaticLabel(pc, edo)
               if (!label) return null
               return (
-                <span key={label} className="compass-label" style={place(pc, 44)}>
+                <span key={label} className="compass-label" style={place(pc, 44, edo)}>
                   {label}
                 </span>
               )
             })}
           </div>
-          <p className="hint">
-            ↑ raises by one step, ↓ lowers by one step. Brighter marks are the usual chromatic notes. A sits at the top.
-          </p>
+          <p className="hint">{compassHint(edo)}</p>
         </section>
       </div>
 
@@ -222,17 +266,27 @@ export default function App() {
           <h2>Steadiness</h2>
           <span className="trace-scale">±5¢ in the band</span>
         </div>
-        <Trace samples={frame.trace} />
+        <Trace samples={frame.trace} halfStep={halfStep} />
       </section>
     </div>
   )
 }
 
-function Readout({ reading, dim }: { reading: PitchReading | null; dim: boolean }) {
+function Readout({
+  reading,
+  dim,
+  edo,
+  halfStep,
+}: {
+  reading: PitchReading | null
+  dim: boolean
+  edo: Edo
+  halfStep: number
+}) {
   const needle = reading
-    ? Math.min(100, Math.max(0, ((reading.cents + HALF_STEP_CENTS) / (HALF_STEP_CENTS * 2)) * 100))
+    ? Math.min(100, Math.max(0, ((reading.cents + halfStep) / (halfStep * 2)) * 100))
     : 50
-  const zone = (10 / (HALF_STEP_CENTS * 2)) * 100
+  const zone = (10 / (halfStep * 2)) * 100
   const color = reading ? markColor(reading.cents) : 'var(--muted)'
 
   return (
@@ -261,10 +315,10 @@ function Readout({ reading, dim }: { reading: PitchReading | null; dim: boolean 
       <div
         className="meter"
         role="meter"
-        aria-valuemin={-HALF_STEP_CENTS}
-        aria-valuemax={HALF_STEP_CENTS}
+        aria-valuemin={-halfStep}
+        aria-valuemax={halfStep}
         aria-valuenow={reading ? Number(reading.cents.toFixed(1)) : 0}
-        aria-label="Cents from the nearest 36-EDO pitch"
+        aria-label={`Cents from the nearest ${edo}-EDO pitch`}
       >
         <div className="meter-track">
           <div className="meter-zone" style={{ left: `${50 - zone / 2}%`, width: `${zone}%` }} />
@@ -281,7 +335,7 @@ function Readout({ reading, dim }: { reading: PitchReading | null; dim: boolean 
   )
 }
 
-function Trace({ samples }: { samples: (number | null)[] }) {
+function Trace({ samples, halfStep }: { samples: (number | null)[]; halfStep: number }) {
   const mid = 24
   const reach = 18
   const paths: string[] = []
@@ -293,11 +347,11 @@ function Trace({ samples }: { samples: (number | null)[] }) {
       return
     }
     const x = (index / (samples.length - 1)) * 100
-    const y = mid - (Math.max(-HALF_STEP_CENTS, Math.min(HALF_STEP_CENTS, cents)) / HALF_STEP_CENTS) * reach
+    const y = mid - (Math.max(-halfStep, Math.min(halfStep, cents)) / halfStep) * reach
     path += `${path ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`
   })
   if (path) paths.push(path)
-  const band = (5 / HALF_STEP_CENTS) * reach
+  const band = (5 / halfStep) * reach
 
   return (
     <svg

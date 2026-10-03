@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { A4_HZ, describeFrequency, spellPitchClass, type PitchReading } from './edo'
+import {
+  A4_HZ,
+  describeFrequency,
+  remapPitchClass,
+  spellPitchClass,
+  type Edo,
+  type PitchReading,
+} from './edo'
 import { detectPitch, rms } from './pitch'
 
 const TRACE_LENGTH = 96
@@ -30,6 +37,7 @@ class TunerEngine {
   private opening: Promise<void> | null = null
   private toneHz = A4_HZ
   private referenceHz = A4_HZ
+  private edo: Edo = 36
   private lastLevel = 0
   private lastAnalysis = 0
   private lastHeardAt = 0
@@ -117,11 +125,18 @@ class TunerEngine {
     this.applyToneHz()
   }
 
-  setReferenceHz(hz: number): void {
-    this.referenceHz = hz
-    if (!this.stable) return
-    this.stable = describeFrequency(this.stable.heardHz, hz)
-    this.emit(this.stable, this.lastLevel)
+  setTuning(a4Hz: number, edo: Edo): void {
+    const edoChanged = edo !== this.edo
+    this.referenceHz = a4Hz
+    this.edo = edo
+    if (edoChanged) {
+      this.trace = Array.from({ length: TRACE_LENGTH }, () => null)
+      this.candidateKey = ''
+      this.candidateCount = 0
+      this.window = []
+    }
+    if (this.stable) this.stable = describeFrequency(this.stable.heardHz, a4Hz, edo)
+    if (edoChanged || this.stable) this.emit(this.stable, this.lastLevel)
   }
 
   dispose(): void {
@@ -219,7 +234,7 @@ class TunerEngine {
 
   /** Keep the current note until a new one has shown up on two analyses, then median-smooth. */
   private accept(hz: number): PitchReading {
-    const immediate = describeFrequency(hz, this.referenceHz)
+    const immediate = describeFrequency(hz, this.referenceHz, this.edo)
     const key = `${immediate.pitchClass}:${immediate.octave}`
     if (key !== this.candidateKey) {
       this.candidateKey = key
@@ -234,7 +249,7 @@ class TunerEngine {
     if (!this.stable || this.candidateCount >= 2) {
       const sorted = [...this.window].sort((a, b) => a - b)
       const median = sorted[Math.floor(sorted.length / 2)]
-      this.stable = describeFrequency(median, this.referenceHz)
+      this.stable = describeFrequency(median, this.referenceHz, this.edo)
     }
     return this.stable
   }
@@ -267,10 +282,10 @@ function micErrorMessage(error: unknown): string {
 
 const EMPTY_TRACE: (number | null)[] = Array.from({ length: TRACE_LENGTH }, () => null)
 
-export function useTuner(a4Hz: number) {
+export function useTuner(a4Hz: number, edo: Edo) {
   const engineRef = useRef<TunerEngine | null>(null)
   const a4Ref = useRef(a4Hz)
-  a4Ref.current = a4Hz
+  const edoRef = useRef(edo)
   const [frame, setFrame] = useState<TunerFrame>({
     reading: null,
     level: 0,
@@ -284,7 +299,7 @@ export function useTuner(a4Hz: number) {
 
   useEffect(() => {
     const engine = new TunerEngine(setFrame)
-    engine.setReferenceHz(a4Ref.current)
+    engine.setTuning(a4Ref.current, edoRef.current)
     engineRef.current = engine
     return () => {
       engine.dispose()
@@ -293,8 +308,8 @@ export function useTuner(a4Hz: number) {
   }, [])
 
   useEffect(() => {
-    engineRef.current?.setReferenceHz(a4Hz)
-  }, [a4Hz])
+    engineRef.current?.setTuning(a4Hz, edo)
+  }, [a4Hz, edo])
 
   const setToneHz = useCallback((hz: number) => {
     engineRef.current?.setToneHz(hz)
@@ -326,7 +341,7 @@ export function useTuner(a4Hz: number) {
   function selectPitch(pc: number) {
     const release = pin?.pc === pc && pin.cOctave === cOctave
     setPin(release ? null : { pc, cOctave })
-    if (!release) engineRef.current?.setToneHz(spellPitchClass(pc, cOctave, a4Hz).hz)
+    if (!release) engineRef.current?.setToneHz(spellPitchClass(pc, cOctave, a4Hz, edo).hz)
     setToneOn(true)
     void engineRef.current?.setToneOn(true)
   }
@@ -335,7 +350,14 @@ export function useTuner(a4Hz: number) {
     const octave = Math.min(6, Math.max(3, next))
     setCOctave(octave)
     setPin((current) => (current ? { ...current, cOctave: octave } : current))
-    if (pin) engineRef.current?.setToneHz(spellPitchClass(pin.pc, octave, a4Hz).hz)
+    if (pin) engineRef.current?.setToneHz(spellPitchClass(pin.pc, octave, a4Hz, edo).hz)
+  }
+
+  function adoptEdo(next: Edo) {
+    setPin((current) => {
+      if (!current || next === edo) return current
+      return { ...current, pc: remapPitchClass(current.pc, edo, next) }
+    })
   }
 
   return {
@@ -350,6 +372,7 @@ export function useTuner(a4Hz: number) {
     toggleTone,
     selectPitch,
     changeOctave,
+    adoptEdo,
     setToneHz,
   }
 }
