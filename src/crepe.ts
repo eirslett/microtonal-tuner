@@ -97,7 +97,8 @@ function decode(raw: ArrayLike<number>): number | null {
 
 /**
  * Tiny CREPE (Kim et al., ICASSP 2018). Weights are the MIT-licensed tiny model
- * from marl/crepe, exported to ONNX.
+ * from marl/crepe, exported to ONNX. Its bins sit a few cents off a pure tone;
+ * the tuner refines that estimate with YIN.
  */
 export class CrepePitch {
   private session: ort.InferenceSession | null = null

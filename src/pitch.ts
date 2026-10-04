@@ -32,13 +32,21 @@ export function storePitchAlgorithm(algorithm: PitchAlgorithm): void {
 /**
  * YIN pitch detector. Monophonic, and stable enough for an oboe fundamental
  * with a strong harmonic series.
+ *
+ * Pass a frequency window to measure cents around a coarse estimate. The lag
+ * search is padded by a couple of samples so the parabolic peak is not clipped.
  */
-export function detectPitch(buffer: Float32Array, sampleRate: number): number | null {
-  const minFreq = 150
-  const maxFreq = 2000
+export function detectPitch(
+  buffer: Float32Array,
+  sampleRate: number,
+  range?: { minFreq: number; maxFreq: number },
+): number | null {
+  const minFreq = range?.minFreq ?? 150
+  const maxFreq = range?.maxFreq ?? 2000
   const threshold = 0.15
-  const tauMax = Math.min(Math.floor(buffer.length / 2), Math.floor(sampleRate / minFreq))
-  const tauMin = Math.max(2, Math.floor(sampleRate / maxFreq))
+  const pad = range ? 2 : 0
+  const tauMax = Math.min(Math.floor(buffer.length / 2) - pad, Math.floor(sampleRate / minFreq) + pad)
+  const tauMin = Math.max(2, Math.floor(sampleRate / maxFreq) - pad)
   if (tauMax <= tauMin) return null
 
   const yin = new Float32Array(tauMax + 1)
@@ -78,8 +86,21 @@ export function detectPitch(buffer: Float32Array, sampleRate: number): number | 
   if (!Number.isFinite(better) || better <= 0) return null
 
   const frequency = sampleRate / better
-  if (frequency < minFreq || frequency > maxFreq) return null
+  const low = range ? minFreq * 2 ** (-20 / 1200) : minFreq
+  const high = range ? maxFreq * 2 ** (20 / 1200) : maxFreq
+  if (frequency < low || frequency > high) return null
   return frequency
+}
+
+/** Lock cents with YIN inside a narrow band around a coarse pitch estimate. */
+export function refinePitch(buffer: Float32Array, sampleRate: number, coarseHz: number): number {
+  if (!Number.isFinite(coarseHz) || coarseHz <= 0) return coarseHz
+  const ratio = 2 ** (50 / 1200)
+  const refined = detectPitch(buffer, sampleRate, {
+    minFreq: coarseHz / ratio,
+    maxFreq: coarseHz * ratio,
+  })
+  return refined ?? coarseHz
 }
 
 export function rms(buffer: Float32Array): number {

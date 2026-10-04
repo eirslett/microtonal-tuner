@@ -8,7 +8,7 @@ import {
   type PitchReading,
 } from './edo'
 import { CrepePitch, SampleRing, crepeWindowLength } from './crepe'
-import { detectPitch, rms, type PitchAlgorithm } from './pitch'
+import { detectPitch, refinePitch, rms, type PitchAlgorithm } from './pitch'
 
 const TRACE_LENGTH = 96
 const ANALYSIS_INTERVAL_MS = 45
@@ -609,7 +609,7 @@ class TunerEngine {
       .then((hz) => {
         if (token !== this.crepeToken || !this.listening || hz == null) return
         this.lastHeardAt = performance.now()
-        const reading = this.accept(hz)
+        const reading = this.accept(refinePitch(samples, sampleRate, hz))
         this.pushTrace(reading.cents)
         this.emit(reading, this.lastLevel)
       })
