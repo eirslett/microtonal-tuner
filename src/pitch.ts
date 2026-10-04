@@ -1,3 +1,34 @@
+export const PITCH_ALGORITHM_CHOICES = ['crepe', 'yin'] as const
+export type PitchAlgorithm = (typeof PITCH_ALGORITHM_CHOICES)[number]
+const PITCH_ALGORITHM_STORAGE_KEY = 'pitch-algorithm'
+const DEFAULT_PITCH_ALGORITHM: PitchAlgorithm = 'crepe'
+
+export function isPitchAlgorithm(value: string): value is PitchAlgorithm {
+  return value === 'crepe' || value === 'yin'
+}
+
+export function pitchAlgorithmLabel(algorithm: PitchAlgorithm): string {
+  return algorithm === 'crepe' ? 'CREPE' : 'YIN'
+}
+
+export function readStoredPitchAlgorithm(): PitchAlgorithm {
+  try {
+    const stored = localStorage.getItem(PITCH_ALGORITHM_STORAGE_KEY)
+    if (stored && isPitchAlgorithm(stored)) return stored
+  } catch {
+    // localStorage can throw when storage is blocked.
+  }
+  return DEFAULT_PITCH_ALGORITHM
+}
+
+export function storePitchAlgorithm(algorithm: PitchAlgorithm): void {
+  try {
+    localStorage.setItem(PITCH_ALGORITHM_STORAGE_KEY, algorithm)
+  } catch {
+    // Ignore a full or blocked store; the choice still applies for this visit.
+  }
+}
+
 /**
  * YIN pitch detector. Monophonic, and stable enough for an oboe fundamental
  * with a strong harmonic series.

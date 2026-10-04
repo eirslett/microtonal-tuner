@@ -18,6 +18,13 @@ import {
   type Edo,
   type PitchReading,
 } from './edo'
+import {
+  isPitchAlgorithm,
+  pitchAlgorithmLabel,
+  readStoredPitchAlgorithm,
+  storePitchAlgorithm,
+  PITCH_ALGORITHM_CHOICES,
+} from './pitch'
 import { useTuner } from './useTuner'
 import './App.css'
 
@@ -56,7 +63,8 @@ function markColor(cents: number): string {
 export default function App() {
   const [a4Hz, setA4Hz] = useState(readStoredA4)
   const [edo, setEdo] = useState(readStoredEdo)
-  const tuner = useTuner(a4Hz, edo)
+  const [algorithm, setAlgorithm] = useState(readStoredPitchAlgorithm)
+  const tuner = useTuner(a4Hz, edo, algorithm)
   const { frame, listening, error, toneOn, pin, cOctave, setToneHz } = tuner
   const reading = frame.reading
   const halfStep = halfStepCents(edo)
@@ -135,6 +143,22 @@ export default function App() {
                 ))}
               </select>
             </label>
+            <select
+              value={algorithm}
+              aria-label="Pitch algorithm"
+              onChange={(event) => {
+                const next = event.target.value
+                if (!isPitchAlgorithm(next)) return
+                setAlgorithm(next)
+                storePitchAlgorithm(next)
+              }}
+            >
+              {PITCH_ALGORITHM_CHOICES.map((choice) => (
+                <option key={choice} value={choice}>
+                  {pitchAlgorithmLabel(choice)}
+                </option>
+              ))}
+            </select>
           </div>
           <span className="reference-note">one step = {formatStepCents(edo)}¢</span>
         </div>

@@ -17,6 +17,10 @@ const base = pagesBase()
 // https://vite.dev/config/
 export default defineConfig({
   base,
+  build: {
+    // Keep the mic worklet as a real file. iPad rejects data-URL worklet modules.
+    assetsInlineLimit: 0,
+  },
   plugins: [
     react(),
     VitePWA({
@@ -56,7 +60,9 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,webmanifest}'],
+        globPatterns: ['**/*.{js,mjs,css,html,svg,png,webmanifest,onnx,wasm}'],
+        // The CREPE runtime is a single ~14 MB wasm file.
+        maximumFileSizeToCacheInBytes: 20 * 1024 * 1024,
         runtimeCaching: [
           {
             urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,

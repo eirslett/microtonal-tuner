@@ -7,7 +7,8 @@ import {
   type Edo,
   type PitchReading,
 } from './edo'
-import { detectPitch, rms } from './pitch'
+import { CrepePitch, SampleRing, crepeWindowLength } from './crepe'
+import { detectPitch, rms, type PitchAlgorithm } from './pitch'
 
 const TRACE_LENGTH = 96
 const ANALYSIS_INTERVAL_MS = 45
@@ -105,8 +106,17 @@ class TunerEngine {
   private toneHz = A4_HZ
   private referenceHz = A4_HZ
   private edo: Edo = 36
+  private algorithm: PitchAlgorithm = 'crepe'
+  private captureGeneration = 0
   private noiseFloor = SILENCE_RMS
   private meterGain = 1
+  private capture: AudioWorkletNode | null = null
+  private captureMute: GainNode | null = null
+  private readonly ring = new SampleRing()
+  private crepe: CrepePitch | null = null
+  private crepeBusy = false
+  private crepeFailed = false
+  private crepeToken = 0
   private lastLevel = 0
   private lastAnalysis = 0
   private lastHeardAt = 0
@@ -118,19 +128,29 @@ class TunerEngine {
 
   private readonly onFrame: EngineListener
   private readonly onDeviceStop: (stop: DeviceStop) => void
+  private readonly onError: (message: string) => void
 
-  constructor(onFrame: EngineListener, onDeviceStop: (stop: DeviceStop) => void) {
+  constructor(
+    onFrame: EngineListener,
+    onDeviceStop: (stop: DeviceStop) => void,
+    onError: (message: string) => void,
+  ) {
     this.onFrame = onFrame
     this.onDeviceStop = onDeviceStop
+    this.onError = onError
   }
 
-  async startMic(): Promise<void> {
-    if (this.listening) return
-    if (this.opening) return this.opening
+  async startMic(): Promise<boolean> {
+    if (this.listening) return true
+    if (this.opening) {
+      await this.opening
+      return this.listening
+    }
     this.opening = this.openMic().finally(() => {
       this.opening = null
     })
-    return this.opening
+    await this.opening
+    return this.listening
   }
 
   private async openMic(): Promise<void> {
@@ -165,14 +185,99 @@ class TunerEngine {
       track.contentHint = 'music'
       track.addEventListener('ended', this.onTrackEnded)
     }
+    while (
+      !this.disposed &&
+      this.source === source &&
+      this.algorithm === 'crepe' &&
+      !this.capture &&
+      !this.crepeFailed
+    ) {
+      await this.enableCrepe(ctx, source)
+    }
+    if (this.disposed || this.source !== source) return
+    if (this.algorithm !== 'crepe') this.stopCapture()
     this.listening = true
     this.lastAnalysis = 0
     this.loop()
   }
 
+  setAlgorithm(algorithm: PitchAlgorithm): void {
+    if (algorithm === this.algorithm) return
+    this.algorithm = algorithm
+    this.candidateKey = ''
+    this.candidateCount = 0
+    this.window = []
+    if (algorithm === 'yin') {
+      this.captureGeneration += 1
+      this.stopCapture()
+      return
+    }
+    const ctx = this.ctx
+    const source = this.source
+    if (!this.listening || !ctx || !source) return
+    void this.enableCrepe(ctx, source)
+  }
+
+  private async enableCrepe(ctx: AudioContext, source: MediaStreamAudioSourceNode): Promise<void> {
+    const generation = ++this.captureGeneration
+    this.crepeFailed = false
+    try {
+      await ctx.audioWorklet.addModule(new URL('./mic-capture-processor.js', import.meta.url))
+      if (this.captureStale(generation, source)) return
+      const capture = new AudioWorkletNode(ctx, 'mic-capture')
+      capture.port.onmessage = (event: MessageEvent<Float32Array>) => {
+        if (event.data instanceof Float32Array) this.ring.push(event.data)
+      }
+      const mute = ctx.createGain()
+      mute.gain.value = 0
+      source.connect(capture)
+      capture.connect(mute)
+      mute.connect(ctx.destination)
+      if (this.captureStale(generation, source)) {
+        capture.port.close()
+        capture.disconnect()
+        mute.disconnect()
+        return
+      }
+      this.capture = capture
+      this.captureMute = mute
+      this.crepe ??= new CrepePitch()
+      void this.crepe.load().catch((error: unknown) => {
+        if (generation !== this.captureGeneration || this.disposed || this.crepeFailed) return
+        this.crepeFailed = true
+        this.onError(error instanceof Error ? error.message : 'The pitch model could not be loaded.')
+      })
+    } catch (error) {
+      if (this.captureStale(generation, source)) return
+      this.crepeFailed = true
+      this.onError(error instanceof Error ? error.message : 'The pitch model could not be loaded.')
+    }
+  }
+
+  private captureStale(generation: number, source: MediaStreamAudioSourceNode): boolean {
+    return (
+      generation !== this.captureGeneration ||
+      this.algorithm !== 'crepe' ||
+      this.disposed ||
+      this.source !== source
+    )
+  }
+
+  private stopCapture(): void {
+    this.crepeToken += 1
+    this.crepeBusy = false
+    this.capture?.port.close()
+    this.capture?.disconnect()
+    this.captureMute?.disconnect()
+    this.capture = null
+    this.captureMute = null
+    this.ring.clear()
+  }
+
   stopMic(): void {
     this.listening = false
     cancelAnimationFrame(this.raf)
+    this.stopCapture()
     this.stream?.getTracks().forEach((track) => track.stop())
     this.source?.disconnect()
     this.stream = null
@@ -473,6 +578,13 @@ class TunerEngine {
       return
     }
 
+    if (this.algorithm === 'crepe') {
+      this.pushTrace(this.stable?.cents ?? null)
+      this.emit(this.stable, shown)
+      this.queueCrepe(ctx.sampleRate)
+      return
+    }
+
     const hz = detectPitch(buffer, ctx.sampleRate)
     if (hz == null) {
       this.pushTrace(this.stable?.cents ?? null)
@@ -484,6 +596,31 @@ class TunerEngine {
     const reading = this.accept(hz)
     this.pushTrace(reading.cents)
     this.emit(reading, shown)
+  }
+
+  private queueCrepe(sampleRate: number): void {
+    if (this.crepeBusy || this.crepeFailed || !this.crepe) return
+    const samples = this.ring.latest(crepeWindowLength(sampleRate))
+    if (!samples) return
+    const token = this.crepeToken
+    this.crepeBusy = true
+    void this.crepe
+      .detect(samples, sampleRate)
+      .then((hz) => {
+        if (token !== this.crepeToken || !this.listening || hz == null) return
+        this.lastHeardAt = performance.now()
+        const reading = this.accept(hz)
+        this.pushTrace(reading.cents)
+        this.emit(reading, this.lastLevel)
+      })
+      .catch((error: unknown) => {
+        if (token !== this.crepeToken || this.crepeFailed) return
+        this.crepeFailed = true
+        this.onError(error instanceof Error ? error.message : 'Pitch detection failed.')
+      })
+      .finally(() => {
+        if (token === this.crepeToken) this.crepeBusy = false
+      })
   }
 
   /** Keep the current note until a new one has shown up on two analyses, then median-smooth. */
@@ -536,10 +673,11 @@ function micErrorMessage(error: unknown): string {
 
 const EMPTY_TRACE: (number | null)[] = Array.from({ length: TRACE_LENGTH }, () => null)
 
-export function useTuner(a4Hz: number, edo: Edo) {
+export function useTuner(a4Hz: number, edo: Edo, algorithm: PitchAlgorithm) {
   const engineRef = useRef<TunerEngine | null>(null)
   const a4Ref = useRef(a4Hz)
   const edoRef = useRef(edo)
+  const algorithmRef = useRef(algorithm)
   const [frame, setFrame] = useState<TunerFrame>({
     reading: null,
     level: 0,
@@ -550,13 +688,23 @@ export function useTuner(a4Hz: number, edo: Edo) {
   const [toneOn, setToneOn] = useState(false)
   const [pin, setPin] = useState<Pin | null>(null)
   const [cOctave, setCOctave] = useState(4)
+  const [appliedAlgorithm, setAppliedAlgorithm] = useState(algorithm)
+  if (algorithm !== appliedAlgorithm) {
+    setAppliedAlgorithm(algorithm)
+    setError(null)
+  }
 
   useEffect(() => {
-    const engine = new TunerEngine(setFrame, ({ tone, mic }) => {
-      if (tone) setToneOn(false)
-      if (mic) setListening(false)
-    })
+    const engine = new TunerEngine(
+      setFrame,
+      ({ tone, mic }) => {
+        if (tone) setToneOn(false)
+        if (mic) setListening(false)
+      },
+      setError,
+    )
     engine.setTuning(a4Ref.current, edoRef.current)
+    engine.setAlgorithm(algorithmRef.current)
     engineRef.current = engine
     return () => {
       engine.dispose()
@@ -568,6 +716,10 @@ export function useTuner(a4Hz: number, edo: Edo) {
     engineRef.current?.setTuning(a4Hz, edo)
   }, [a4Hz, edo])
 
+  useEffect(() => {
+    engineRef.current?.setAlgorithm(algorithm)
+  }, [algorithm])
+
   const setToneHz = useCallback((hz: number) => {
     engineRef.current?.setToneHz(hz)
   }, [])
@@ -575,8 +727,8 @@ export function useTuner(a4Hz: number, edo: Edo) {
   async function start() {
     setError(null)
     try {
-      await engineRef.current?.startMic()
-      setListening(true)
+      const started = await engineRef.current?.startMic()
+      if (started) setListening(true)
     } catch (error) {
       setListening(false)
       setError(micErrorMessage(error))
