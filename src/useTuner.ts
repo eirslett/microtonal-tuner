@@ -13,6 +13,15 @@ const TRACE_LENGTH = 96
 const ANALYSIS_INTERVAL_MS = 45
 const SILENCE_HOLD_MS = 220
 const SILENCE_RMS = 0.008
+// iPad's raw mic, with speech processing off, is much quieter than a laptop mic.
+const IOS_SILENCE_RMS = 0.0004
+const IOS_METER_GAIN = 16
+
+function isIosDevice(): boolean {
+  const ua = navigator.userAgent
+  if (/iPad|iPhone|iPod/.test(ua)) return true
+  return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1
+}
 
 type WebAudioSessionType = 'auto' | 'playback' | 'play-and-record' | 'ambient' | 'transient' | 'transient-solo'
 type WebAudioSessionState = 'inactive' | 'active' | 'interrupted'
@@ -96,6 +105,8 @@ class TunerEngine {
   private toneHz = A4_HZ
   private referenceHz = A4_HZ
   private edo: Edo = 36
+  private noiseFloor = SILENCE_RMS
+  private meterGain = 1
   private lastLevel = 0
   private lastAnalysis = 0
   private lastHeardAt = 0
@@ -127,11 +138,15 @@ class TunerEngine {
       throw new Error('This browser cannot use a microphone here.')
     }
     this.beginOutput('play-and-record')
+    const ios = isIosDevice()
+    this.noiseFloor = ios ? IOS_SILENCE_RMS : SILENCE_RMS
+    this.meterGain = ios ? IOS_METER_GAIN : 1
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
         noiseSuppression: false,
-        autoGainControl: false,
+        // iPad leaves the raw mic very quiet unless automatic gain is allowed.
+        autoGainControl: ios,
         channelCount: 1,
       },
       video: false,
@@ -146,7 +161,10 @@ class TunerEngine {
     this.source = source
     this.analyser = analyser
     this.buffer = new Float32Array(analyser.fftSize)
-    for (const track of stream.getTracks()) track.addEventListener('ended', this.onTrackEnded)
+    for (const track of stream.getTracks()) {
+      track.contentHint = 'music'
+      track.addEventListener('ended', this.onTrackEnded)
+    }
     this.listening = true
     this.lastAnalysis = 0
     this.loop()
@@ -439,17 +457,18 @@ class TunerEngine {
 
     analyser.getFloatTimeDomainData(buffer)
     const level = rms(buffer)
-    if (level < SILENCE_RMS) {
+    const shown = Math.min(1, level * this.meterGain)
+    if (level < this.noiseFloor) {
       if (now - this.lastHeardAt > SILENCE_HOLD_MS) {
         this.stable = null
         this.window = []
         this.candidateKey = ''
         this.candidateCount = 0
         this.pushTrace(null)
-        this.emit(null, level)
+        this.emit(null, shown)
       } else {
         this.pushTrace(this.stable?.cents ?? null)
-        this.emit(this.stable, level)
+        this.emit(this.stable, shown)
       }
       return
     }
@@ -457,14 +476,14 @@ class TunerEngine {
     const hz = detectPitch(buffer, ctx.sampleRate)
     if (hz == null) {
       this.pushTrace(this.stable?.cents ?? null)
-      this.emit(this.stable, level)
+      this.emit(this.stable, shown)
       return
     }
 
     this.lastHeardAt = now
     const reading = this.accept(hz)
     this.pushTrace(reading.cents)
-    this.emit(reading, level)
+    this.emit(reading, shown)
   }
 
   /** Keep the current note until a new one has shown up on two analyses, then median-smooth. */
