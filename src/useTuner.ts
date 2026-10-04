@@ -14,6 +14,50 @@ const ANALYSIS_INTERVAL_MS = 45
 const SILENCE_HOLD_MS = 220
 const SILENCE_RMS = 0.008
 
+type WebAudioSessionType = 'auto' | 'playback' | 'play-and-record' | 'ambient' | 'transient' | 'transient-solo'
+
+function webAudioSession(): { type: WebAudioSessionType } | null {
+  const session = (navigator as Navigator & { audioSession?: { type: WebAudioSessionType } }).audioSession
+  return session ?? null
+}
+
+function preferAudioSession(type: 'playback' | 'play-and-record'): void {
+  const session = webAudioSession()
+  if (!session || session.type === type) return
+  if (type === 'playback' && session.type === 'play-and-record') return
+  try {
+    session.type = type
+  } catch {
+    // Safari only allows a session change during a user gesture.
+  }
+}
+
+function silentWavUrl(): string {
+  const samples = 16
+  const dataSize = samples * 2
+  const buffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(buffer)
+  const write = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i))
+  }
+  write(0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  write(8, 'WAVE')
+  write(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, 8000, true)
+  view.setUint32(28, 16000, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  write(36, 'data')
+  view.setUint32(40, dataSize, true)
+  let binary = ''
+  for (const byte of new Uint8Array(buffer)) binary += String.fromCharCode(byte)
+  return `data:audio/wav;base64,${btoa(binary)}`
+}
+
 export type Pin = { pc: number; cOctave: number }
 
 export type TunerFrame = {
@@ -32,9 +76,13 @@ class TunerEngine {
   private buffer: Float32Array<ArrayBuffer> | null = null
   private master: GainNode | null = null
   private partials: OscillatorNode[] = []
+  private partialGains: GainNode[] = []
   private raf = 0
   private listening = false
   private opening: Promise<void> | null = null
+  private toneWanted = false
+  private speaker: HTMLAudioElement | null = null
+  private speakerPlay: Promise<void> | null = null
   private toneHz = A4_HZ
   private referenceHz = A4_HZ
   private edo: Edo = 36
@@ -66,7 +114,7 @@ class TunerEngine {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('This browser cannot use a microphone here.')
     }
-    await this.ensureContext()
+    this.beginOutput('play-and-record')
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
@@ -109,14 +157,20 @@ class TunerEngine {
   }
 
   async setToneOn(on: boolean): Promise<void> {
-    await this.ensureContext()
+    this.toneWanted = on
+    if (!on) {
+      this.setMasterGain(false)
+      return
+    }
+    // iPad will not audibly start Web Audio until this tap also opens the
+    // media session. Do that before any await, or the gesture is gone.
+    this.beginOutput(this.listening ? 'play-and-record' : 'playback')
+    const wasRunning = this.ctx?.state === 'running'
     this.ensurePartials()
     this.applyToneHz()
-    const ctx = this.ctx!
-    const gain = this.master!
-    const now = ctx.currentTime
-    gain.gain.cancelScheduledValues(now)
-    gain.gain.setTargetAtTime(on ? 1 : 0, now, on ? 0.02 : 0.04)
+    this.setMasterGain(true)
+    if (wasRunning) return
+    await this.finishUnlock()
   }
 
   setToneHz(hz: number): void {
@@ -151,26 +205,113 @@ class TunerEngine {
       osc.disconnect()
     }
     this.partials = []
+    for (const gain of this.partialGains) gain.disconnect()
+    this.partialGains = []
+    this.speaker?.pause()
+    this.speaker = null
+    this.speakerPlay = null
     this.master?.disconnect()
     void this.ctx?.close()
     this.ctx = null
     this.master = null
   }
 
-  private async ensureContext(): Promise<void> {
+  private beginOutput(session: 'playback' | 'play-and-record'): void {
+    preferAudioSession(session)
     if (!this.ctx) {
       this.ctx = new AudioContext()
       this.master = this.ctx.createGain()
       this.master.gain.value = 0
       this.master.connect(this.ctx.destination)
     }
-    if (this.ctx.state === 'suspended') await this.ctx.resume()
+    if (this.ctx.state !== 'running') void this.ctx.resume()
+    this.playSilentPulse()
+    this.blip()
+  }
+
+  private playSilentPulse(): void {
+    if (!this.speaker) {
+      const speaker = new Audio(silentWavUrl())
+      speaker.preload = 'auto'
+      speaker.setAttribute('playsinline', '')
+      this.speaker = speaker
+    }
+    const speaker = this.speaker
+    try {
+      speaker.currentTime = 0
+    } catch {
+      // Metadata may not be ready yet. play() still counts as the gesture.
+    }
+    this.speakerPlay = speaker.play().then(
+      () => undefined,
+      () => undefined,
+    )
+  }
+
+  private blip(): void {
+    const ctx = this.ctx
+    if (!ctx) return
+    const buffer = ctx.createBuffer(1, 1, ctx.sampleRate)
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+    source.connect(ctx.destination)
+    try {
+      source.start()
+    } catch {
+      // The context can already be closed.
+    }
+  }
+
+  private async finishUnlock(): Promise<void> {
+    const ctx = this.ctx
+    if (!ctx) return
+    await this.speakerPlay
+    try {
+      if (ctx.state !== 'running') await ctx.resume()
+    } catch {
+      // The silent clip may already have opened the session.
+    }
+    if (!this.toneWanted || ctx.state !== 'running') return
+    // Oscillators started while the context was still suspended stay silent on iPad.
+    this.restartPartials()
+    this.applyToneHz()
+    this.setMasterGain(true)
+  }
+
+  private setMasterGain(on: boolean): void {
+    const ctx = this.ctx
+    const master = this.master
+    if (!ctx || !master) return
+    const now = ctx.currentTime
+    const gain = master.gain
+    gain.cancelScheduledValues(now)
+    if (ctx.state === 'running') {
+      gain.setTargetAtTime(on ? 1 : 0, now, on ? 0.02 : 0.04)
+      return
+    }
+    gain.setValueAtTime(on ? 1 : 0, now)
+  }
+
+  private restartPartials(): void {
+    const now = this.ctx?.currentTime ?? 0
+    for (const osc of this.partials) {
+      try {
+        osc.stop(now)
+      } catch {
+        // already stopped
+      }
+      osc.disconnect()
+    }
+    for (const gain of this.partialGains) gain.disconnect()
+    this.partials = []
+    this.partialGains = []
+    this.ensurePartials()
   }
 
   private ensurePartials(): void {
     if (!this.ctx || !this.master || this.partials.length > 0) return
-    const gains = [0.14, 0.05, 0.025]
-    this.partials = gains.map((level, index) => {
+    const levels = [0.14, 0.05, 0.025]
+    this.partials = levels.map((level, index) => {
       const osc = this.ctx!.createOscillator()
       osc.type = 'sine'
       osc.frequency.value = this.toneHz * (index + 1)
@@ -179,6 +320,7 @@ class TunerEngine {
       osc.connect(gain)
       gain.connect(this.master!)
       osc.start()
+      this.partialGains.push(gain)
       return osc
     })
   }
