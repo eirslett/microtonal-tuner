@@ -1,7 +1,11 @@
 .app {
   width: min(1040px, 100%);
   margin: 0 auto;
-  padding: 28px 22px 56px;
+  padding:
+    calc(28px + env(safe-area-inset-top, 0px))
+    calc(22px + env(safe-area-inset-right, 0px))
+    calc(56px + env(safe-area-inset-bottom, 0px))
+    calc(22px + env(safe-area-inset-left, 0px));
 }
 
 .top {
@@ -501,7 +505,11 @@ button:focus-visible,
 
 @media (max-width: 860px) {
   .app {
-    padding: 20px 16px 40px;
+    padding:
+      calc(20px + env(safe-area-inset-top, 0px))
+      calc(16px + env(safe-area-inset-right, 0px))
+      calc(40px + env(safe-area-inset-bottom, 0px))
+      calc(16px + env(safe-area-inset-left, 0px));
   }
 
   .tuning {
