@@ -15,9 +15,15 @@ const SILENCE_HOLD_MS = 220
 const SILENCE_RMS = 0.008
 
 type WebAudioSessionType = 'auto' | 'playback' | 'play-and-record' | 'ambient' | 'transient' | 'transient-solo'
+type WebAudioSessionState = 'inactive' | 'active' | 'interrupted'
 
-function webAudioSession(): { type: WebAudioSessionType } | null {
-  const session = (navigator as Navigator & { audioSession?: { type: WebAudioSessionType } }).audioSession
+type WebAudioSession = EventTarget & {
+  type: WebAudioSessionType
+  readonly state: WebAudioSessionState
+}
+
+function webAudioSession(): WebAudioSession | null {
+  const session = (navigator as Navigator & { audioSession?: WebAudioSession }).audioSession
   return session ?? null
 }
 
@@ -68,6 +74,8 @@ export type TunerFrame = {
 
 type EngineListener = (frame: TunerFrame) => void
 
+type DeviceStop = { tone: boolean; mic: boolean }
+
 class TunerEngine {
   private ctx: AudioContext | null = null
   private stream: MediaStream | null = null
@@ -83,6 +91,8 @@ class TunerEngine {
   private toneWanted = false
   private speaker: HTMLAudioElement | null = null
   private speakerPlay: Promise<void> | null = null
+  private outputWatched = false
+  private disposed = false
   private toneHz = A4_HZ
   private referenceHz = A4_HZ
   private edo: Edo = 36
@@ -96,9 +106,11 @@ class TunerEngine {
   private trace: (number | null)[] = Array.from({ length: TRACE_LENGTH }, () => null)
 
   private readonly onFrame: EngineListener
+  private readonly onDeviceStop: (stop: DeviceStop) => void
 
-  constructor(onFrame: EngineListener) {
+  constructor(onFrame: EngineListener, onDeviceStop: (stop: DeviceStop) => void) {
     this.onFrame = onFrame
+    this.onDeviceStop = onDeviceStop
   }
 
   async startMic(): Promise<void> {
@@ -134,6 +146,7 @@ class TunerEngine {
     this.source = source
     this.analyser = analyser
     this.buffer = new Float32Array(analyser.fftSize)
+    for (const track of stream.getTracks()) track.addEventListener('ended', this.onTrackEnded)
     this.listening = true
     this.lastAnalysis = 0
     this.loop()
@@ -160,6 +173,7 @@ class TunerEngine {
     this.toneWanted = on
     if (!on) {
       this.setMasterGain(false)
+      this.publishPlayback(false)
       return
     }
     // iPad will not audibly start Web Audio until this tap also opens the
@@ -169,6 +183,7 @@ class TunerEngine {
     this.ensurePartials()
     this.applyToneHz()
     this.setMasterGain(true)
+    this.publishPlayback(true)
     if (wasRunning) return
     await this.finishUnlock()
   }
@@ -194,6 +209,10 @@ class TunerEngine {
   }
 
   dispose(): void {
+    this.disposed = true
+    this.toneWanted = false
+    this.ctx?.removeEventListener('statechange', this.onContextState)
+    webAudioSession()?.removeEventListener('statechange', this.onSessionState)
     this.stopMic()
     const now = this.ctx?.currentTime ?? 0
     for (const osc of this.partials) {
@@ -225,8 +244,82 @@ class TunerEngine {
       this.master.connect(this.ctx.destination)
     }
     if (this.ctx.state !== 'running') void this.ctx.resume()
+    this.watchOutput()
     this.playSilentPulse()
     this.blip()
+  }
+
+  private watchOutput(): void {
+    if (this.outputWatched || !this.ctx) return
+    this.outputWatched = true
+    this.ctx.addEventListener('statechange', this.onContextState)
+    webAudioSession()?.addEventListener('statechange', this.onSessionState)
+    this.watchMediaKeys()
+  }
+
+  private watchMediaKeys(): void {
+    const session = navigator.mediaSession
+    if (!session) return
+    try {
+      session.metadata = new MediaMetadata({ title: 'Oboe tuner' })
+    } catch {
+      // Metadata is optional. The pause handler is what updates the UI.
+    }
+    for (const action of ['pause', 'stop'] as const) {
+      try {
+        session.setActionHandler(action, () => this.noteExternalStop('tone'))
+      } catch {
+        // This action is not available in the browser.
+      }
+    }
+  }
+
+  private publishPlayback(playing: boolean): void {
+    const session = navigator.mediaSession
+    if (!session) return
+    try {
+      session.playbackState = playing ? 'playing' : 'none'
+    } catch {
+      // Ignore an unsupported playback state.
+    }
+  }
+
+  private onContextState = (): void => {
+    const state = this.ctx?.state as string | undefined
+    if (state === 'interrupted') this.noteExternalStop('tone')
+  }
+
+  private onSessionState = (): void => {
+    if (webAudioSession()?.state === 'interrupted') this.noteExternalStop('all')
+  }
+
+  private onTrackEnded = (): void => {
+    if (!this.listening || this.disposed) return
+    this.stopMic()
+    this.onDeviceStop({ tone: false, mic: true })
+  }
+
+  private noteExternalStop(scope: 'tone' | 'all'): void {
+    if (this.disposed) return
+    const tone = this.toneWanted
+    const mic = scope === 'all' && this.listening
+    if (!tone && !mic) return
+    if (tone) {
+      this.toneWanted = false
+      try {
+        this.setMasterGain(false)
+      } catch {
+        // The context may already be interrupted.
+      }
+      try {
+        this.speaker?.pause()
+      } catch {
+        // The system already paused it.
+      }
+      this.publishPlayback(false)
+    }
+    if (mic) this.stopMic()
+    this.onDeviceStop({ tone, mic })
   }
 
   private playSilentPulse(): void {
@@ -440,7 +533,10 @@ export function useTuner(a4Hz: number, edo: Edo) {
   const [cOctave, setCOctave] = useState(4)
 
   useEffect(() => {
-    const engine = new TunerEngine(setFrame)
+    const engine = new TunerEngine(setFrame, ({ tone, mic }) => {
+      if (tone) setToneOn(false)
+      if (mic) setListening(false)
+    })
     engine.setTuning(a4Ref.current, edoRef.current)
     engineRef.current = engine
     return () => {
